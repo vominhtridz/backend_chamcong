@@ -8,8 +8,9 @@ class Attendance {
     this.checkInTime = data.checkInTime || null;
     this.checkOutTime = data.checkOutTime || null;
 
-    // 3. Trạng thái chấm công
-    // Enum: 'OnTime', 'Late', 'Absent', 'EarlyLeave'
+    this.checkOutStatus = data.checkOutStatus || null;
+    this.note = data.note || '';
+    // 3. Trạng thái: CheckedIn | Complete | OnTime | Late
     this.status = data.status || 'Absent';
 
     // 4. Hình ảnh xác thực (Link ImgBB)
@@ -30,6 +31,8 @@ class Attendance {
       checkInTime: this.checkInTime,
       checkOutTime: this.checkOutTime,
       status: this.status,
+      checkOutStatus: this.checkOutStatus,
+      note: this.note,
       verifyImageIn: this.verifyImageIn,
       verifyImageOut: this.verifyImageOut,
       createdAt: this.createdAt,

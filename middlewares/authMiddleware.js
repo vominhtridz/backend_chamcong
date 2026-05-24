@@ -69,7 +69,7 @@ const protect = async (req, res, next) => {
   }
 };
 
-const RESTRICTED_ALLOWED = [
+const RESTRICTED_AUTH_ALLOWED = [
   { method: 'GET', path: '/me' },
   { method: 'PUT', path: '/profile' },
   { method: 'PATCH', path: '/profile' },
@@ -77,11 +77,21 @@ const RESTRICTED_ALLOWED = [
 
 const isRestrictedAllowed = (req) => {
   const base = (req.baseUrl || '').replace(/\/$/, '');
-  if (base !== '/api/auth') return false;
   const path = req.path || '';
-  return RESTRICTED_ALLOWED.some(
-    (rule) => rule.method === req.method && (path === rule.path || path.endsWith(rule.path))
-  );
+
+  if (base === '/api/auth') {
+    return RESTRICTED_AUTH_ALLOWED.some(
+      (rule) => rule.method === req.method && (path === rule.path || path.endsWith(rule.path))
+    );
+  }
+
+  if (base === '/api/leaves') {
+    if (req.method === 'GET' && path === '/') return true;
+    if (req.method === 'POST' && path === '/') return true;
+    if (req.method === 'DELETE' && /^\/[^/]+$/.test(path)) return true;
+  }
+
+  return false;
 };
 
 const checkStatus = (req, res, next) => {
