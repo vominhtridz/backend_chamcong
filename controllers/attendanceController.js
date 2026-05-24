@@ -12,6 +12,7 @@ const {
   evaluateCheckIn,
   evaluateCheckOut,
   getShiftContext,
+  calcWorkedMinutes,
 } = require('../utils/shiftUtils');
 const { resolveShiftSettings } = require('../utils/shiftSettings');
 
@@ -75,9 +76,16 @@ const logSecurity = async (req, type, extra = {}) => {
   });
 };
 
-const findOpenAttendanceRecord = async (userId, settings, now = new Date()) => {
+/** Bản ghi ca hiện tại: ưu tiên bản ghi chưa check-out, sau đó bản ghi đã hoàn tất trong ngày ca. */
+const findShiftAttendanceRecord = async (userId, settings, now = new Date()) => {
   const shiftDate = getShiftDate(now, settings.workStartTime, settings.workEndTime);
   const primaryKey = `${userId}_${shiftDate}`;
+
+  const primarySnap = await db.ref(`attendances/${primaryKey}`).once('value');
+  if (primarySnap.exists()) {
+    const rec = primarySnap.val();
+    return { recordKey: primaryKey, record: rec, shiftDate: rec.date || shiftDate };
+  }
 
   const attSnap = await db.ref('attendances').once('value');
   const all = attSnap.val() || {};
@@ -94,7 +102,7 @@ const findOpenAttendanceRecord = async (userId, settings, now = new Date()) => {
   });
 
   if (openRecord) {
-    return { recordKey: openKey, record: openRecord, shiftDate: openRecord.date };
+    return { recordKey: openKey, record: openRecord, shiftDate: openRecord.date || shiftDate };
   }
 
   return { recordKey: primaryKey, record: null, shiftDate };
@@ -229,8 +237,16 @@ const checkIn = async (req, res) => {
     }
 
     const fullName = brief.fullName;
-    const openInfo = await findOpenAttendanceRecord(matchedUserId, settings, now);
-    const { recordKey, record: existingRecord, shiftDate } = openInfo;
+    const shiftInfo = await findShiftAttendanceRecord(matchedUserId, settings, now);
+    const { recordKey, record: existingRecord, shiftDate } = shiftInfo;
+
+    if (existingRecord?.checkOutTime) {
+      return res.status(400).json({
+        message:
+          'Bạn đã hoàn tất check-in và check-out cho ca hôm nay. Vui lòng chờ đến ngày ca tiếp theo.',
+        alreadyCompleted: true,
+      });
+    }
 
     if (!existingRecord?.checkInTime) {
       const checkInEval = evaluateCheckIn(now, settings);
@@ -250,11 +266,15 @@ const checkIn = async (req, res) => {
       if (existingSnap.exists()) {
         const saved = existingSnap.val();
         if (saved.checkOutTime) {
-          return res.status(400).json({ message: 'Bạn đã hoàn tất chấm công ca này rồi!' });
+          return res.status(400).json({
+            message:
+              'Bạn đã hoàn tất chấm công ca này. Chờ đến ngày ca tiếp theo để check-in/check-out lại.',
+            alreadyCompleted: true,
+          });
         }
         if (saved.checkInTime) {
           return res.status(400).json({
-            message: 'Bạn đã check-in ca này. Vui lòng check-out khi đến giờ kết thúc.',
+            message: 'Bạn đã check-in ca này. Vui lòng check-out để hoàn tất.',
           });
         }
       }
@@ -262,12 +282,15 @@ const checkIn = async (req, res) => {
       if (!imageUrl) imageUrl = await uploadToImgBB(base64Image);
 
       const ts = Date.now();
+      const checkInStatus = checkInEval.isLate ? 'Late' : 'OnTime';
       await newRef.set({
         userId: matchedUserId,
         date: checkInEval.shiftDate,
         checkInTime: ts,
         checkOutTime: null,
-        status: 'CheckedIn',
+        status: checkInStatus,
+        lateMinutes: checkInEval.lateMinutes,
+        isLate: checkInEval.isLate,
         checkOutStatus: null,
         note: typeof note === 'string' ? note.trim().slice(0, 500) : '',
         verifyImageIn: imageUrl,
@@ -280,14 +303,16 @@ const checkIn = async (req, res) => {
       });
 
       await registerKnownDevice(matchedUserId, meta.deviceFingerprint, ip, userAgent);
+      const lateNote = checkInEval.isLate ? ` (trễ ${checkInEval.lateMinutes} phút)` : '';
       await logActivity({
         type: 'check_in',
         action: 'checkIn',
-        severity: 'info',
+        severity: checkInEval.isLate ? 'warning' : 'info',
         ...brief,
-        message: `Check-in thành công — ${fullName}`,
+        message: `Check-in thành công${lateNote} — ${fullName}`,
         imageUrl,
         faceDistance: match.minDistance,
+        lateMinutes: checkInEval.lateMinutes,
         ip,
         userAgent,
         deviceFingerprint: meta.deviceFingerprint,
@@ -295,45 +320,41 @@ const checkIn = async (req, res) => {
         timestamp: ts,
       });
 
+      const greetMsg = checkInEval.isLate
+        ? `Check-in trễ ${checkInEval.lateMinutes} phút — Xin chào ${fullName}. Vui lòng check-out khi kết thúc ca.`
+        : `Check-in đúng giờ — Xin chào ${fullName}. Vui lòng check-out khi kết thúc ca.`;
+
       return res.status(200).json({
-        message: `Tít! Check-in đúng giờ — Xin chào ${fullName}`,
+        message: greetMsg,
         action: 'checkIn',
         fullName,
         distance: match.minDistance.toFixed(4),
-        status: 'CheckedIn',
+        status: checkInStatus,
+        lateMinutes: checkInEval.lateMinutes,
+        isLate: checkInEval.isLate,
         shiftDate: checkInEval.shiftDate,
-      });
-    }
-
-    if (existingRecord.checkOutTime) {
-      return res.status(400).json({
-        message: 'Bạn đã hoàn tất check-out ca này rồi!',
       });
     }
 
     const recordShiftDate = existingRecord.date || shiftDate;
     const checkOutEval = evaluateCheckOut(now, settings, recordShiftDate);
-    if (!checkOutEval.allowed) {
-      await logSecurity(req, 'time_fail', {
-        user,
-        message: checkOutEval.message,
-        imageUrl,
-      });
-      return res.status(400).json({ message: checkOutEval.message });
-    }
 
     if (!imageUrl) imageUrl = await uploadToImgBB(base64Image);
     const attendanceRef = db.ref(`attendances/${recordKey}`);
     const ts = Date.now();
+    const workedMinutes = calcWorkedMinutes(existingRecord.checkInTime, ts);
 
     await attendanceRef.update({
       checkOutTime: ts,
       checkOutStatus: checkOutEval.checkOutStatus,
+      earlyCheckoutMinutes: checkOutEval.earlyCheckoutMinutes,
+      lateCheckoutMinutes: checkOutEval.lateCheckoutMinutes,
+      workedMinutes,
       status: 'Complete',
       verifyImageOut: imageUrl,
       faceDistanceOut: match.minDistance,
       checkOutLocation: locationMeta,
-      checkOutMeta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint },
+      checkOutMeta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
       updatedAt: ts,
     });
 
@@ -343,22 +364,32 @@ const checkIn = async (req, res) => {
       action: 'checkOut',
       severity: 'info',
       ...brief,
-      message: `Check-out thành công — ${fullName}`,
+      message: `Check-out thành công (${workedMinutes} phút làm) — ${fullName}`,
       imageUrl,
       faceDistance: match.minDistance,
+      workedMinutes,
       ip,
       userAgent,
       location: locationMeta,
       timestamp: ts,
     });
 
+    const outMsg =
+      checkOutEval.lateCheckoutMinutes > 0
+        ? `Check-out trễ ${checkOutEval.lateCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+        : checkOutEval.earlyCheckoutMinutes > 0
+          ? `Check-out sớm ${checkOutEval.earlyCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+          : `Check-out đúng giờ — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`;
+
     return res.status(200).json({
-      message: `Tít! Check-out đúng giờ — Tạm biệt ${fullName}, hẹn gặp lại!`,
+      message: outMsg,
       action: 'checkOut',
       fullName,
       distance: match.minDistance.toFixed(4),
       status: 'Complete',
+      workedMinutes,
       shiftDate: recordShiftDate,
+      alreadyCompleted: true,
     });
   } catch (error) {
     console.error('Lỗi attendanceController.checkIn:', error);
@@ -397,6 +428,11 @@ const mapAttendanceRecord = (key, record, user = {}) => ({
   checkOutTime: record.checkOutTime || null,
   status: record.status,
   checkOutStatus: record.checkOutStatus || null,
+  lateMinutes: record.lateMinutes ?? null,
+  isLate: record.isLate ?? false,
+  earlyCheckoutMinutes: record.earlyCheckoutMinutes ?? null,
+  lateCheckoutMinutes: record.lateCheckoutMinutes ?? null,
+  workedMinutes: record.workedMinutes ?? null,
   note: record.note || '',
   verifyImageIn: record.verifyImageIn || '',
   verifyImageOut: record.verifyImageOut || '',
@@ -459,16 +495,17 @@ const getWorkConfig = async (req, res) => {
     const workShift = userSnap.val()?.workShift || 'office';
     const settings = await loadWorkSettings(workShift);
     const now = new Date();
-    const openInfo = await findOpenAttendanceRecord(userId, settings, now);
-    const existingRecord = openInfo.record;
+    const shiftInfo = await findShiftAttendanceRecord(userId, settings, now);
+    const existingRecord = shiftInfo.record;
     const context = getShiftContext(now, settings, existingRecord);
 
     res.status(200).json({
       ...settings,
       ...context,
       workShift,
-      shiftDate: openInfo.shiftDate,
+      shiftDate: shiftInfo.shiftDate,
       hasRecord: Boolean(existingRecord),
+      isCompleted: Boolean(existingRecord?.checkInTime && existingRecord?.checkOutTime),
       record: existingRecord,
     });
   } catch (error) {
@@ -500,6 +537,204 @@ const updateAttendanceNote = async (req, res) => {
   }
 };
 
+/** Lưu lượt test chấm công (không ghi vào attendances chính thức) */
+const runAttendanceTest = async (req, res) => {
+  try {
+    const { descriptor, base64Image, livenessPassed, livenessChallenge } = req.body;
+    const now = Date.now();
+    const meta = parseClientMeta(req.body);
+    const ip = getClientIp(req);
+    const userAgent = req.headers['user-agent'] || '';
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ message: 'Chưa xác thực tài khoản.' });
+    }
+
+    const userSnap = await db.ref(`users/${userId}`).once('value');
+    const user = userSnap.val();
+    const brief = employeeBrief(user, userId);
+
+    let imageUrl = '';
+    if (base64Image) {
+      try {
+        imageUrl = await uploadToImgBB(base64Image);
+      } catch {
+        imageUrl = '';
+      }
+    }
+
+    const spoofSuspect = meta.brightness != null && meta.brightness < 40;
+    const settings = await loadWorkSettings(user?.workShift || 'office');
+    const geo = evaluateGeofence(meta.latitude, meta.longitude, settings);
+
+    const baseLog = {
+      userId,
+      fullName: brief.fullName,
+      employeeCode: brief.employeeCode,
+      timestamp: now,
+      livenessPassed: Boolean(livenessPassed),
+      livenessChallenge: livenessChallenge || '',
+      brightness: meta.brightness ?? null,
+      spoofSuspect,
+      geofence: {
+        inZone: geo.inZone,
+        distanceMeters: geo.distanceMeters,
+        skipped: geo.skipped,
+      },
+      location:
+        meta.latitude != null
+          ? { latitude: meta.latitude, longitude: meta.longitude }
+          : null,
+      clientMeta: {
+        ip,
+        userAgent,
+        deviceFingerprint: meta.deviceFingerprint,
+      },
+      imageUrl,
+    };
+
+    if (!livenessPassed) {
+      const entry = {
+        ...baseLog,
+        success: false,
+        failureReason: 'liveness_fail',
+        message: 'Chưa vượt qua kiểm tra liveness',
+        faceMatched: false,
+        faceDistance: null,
+        faceReason: null,
+      };
+      const ref = db.ref(`attendanceTests/${userId}`).push();
+      await ref.set(entry);
+      await logSecurity(req, 'liveness_fail', { user, message: entry.message, severity: 'warning' });
+      return res.status(400).json({ message: entry.message, testId: ref.key, ...entry });
+    }
+
+    if (!descriptor || !Array.isArray(descriptor) || descriptor.length !== 128) {
+      const entry = {
+        ...baseLog,
+        success: false,
+        failureReason: 'invalid_descriptor',
+        message: 'Dữ liệu khuôn mặt không hợp lệ',
+        faceMatched: false,
+      };
+      const ref = db.ref(`attendanceTests/${userId}`).push();
+      await ref.set(entry);
+      return res.status(400).json({ message: entry.message, testId: ref.key, ...entry });
+    }
+
+    const faceDataSnap = await db.ref('faceData').once('value');
+    const allFaces = faceDataSnap.val() || {};
+    const match = findFaceMatchForUser(descriptor, userId, allFaces);
+
+    if (!match.matched) {
+      const msgByReason = {
+        no_samples: 'Chưa có mẫu khuôn mặt — liên hệ Admin.',
+        self_no_match: 'Khuôn mặt không khớp hồ sơ của bạn.',
+        other_closer: 'Nghi ngờ giả mạo: khuôn mặt gần hồ sơ người khác hơn.',
+        ambiguous: 'Không xác định được danh tính — thử lại.',
+      };
+      const msg = msgByReason[match.reason] || 'Xác thực khuôn mặt thất bại.';
+      const entry = {
+        ...baseLog,
+        success: false,
+        failureReason: match.reason || 'face_fail',
+        message: msg,
+        faceMatched: false,
+        faceDistance: match.minDistance ?? null,
+        faceReason: match.reason,
+        possibleSpoof: match.reason === 'other_closer' || match.reason === 'ambiguous',
+      };
+      const ref = db.ref(`attendanceTests/${userId}`).push();
+      await ref.set(entry);
+      await logSecurity(req, 'face_fail', {
+        user,
+        message: msg,
+        faceDistance: match.minDistance,
+        reason: match.reason,
+        imageUrl,
+      });
+      return res.status(400).json({ message: msg, testId: ref.key, ...entry });
+    }
+
+    const entry = {
+      ...baseLog,
+      success: true,
+      failureReason: null,
+      message: 'Xác thực thành công — đúng người, không phát hiện giả mạo.',
+      faceMatched: true,
+      faceDistance: match.minDistance,
+      faceReason: 'self_match',
+      possibleSpoof: spoofSuspect,
+      warnings: [
+        ...(spoofSuspect ? ['Ánh sáng thấp — nghi ngờ ảnh/video'] : []),
+        ...(settings.geofenceEnabled && !geo.inZone && !geo.skipped
+          ? [`Ngoài vùng GPS (${geo.distanceMeters}m)`]
+          : []),
+      ],
+    };
+
+    const ref = db.ref(`attendanceTests/${userId}`).push();
+    await ref.set(entry);
+
+    return res.status(200).json({
+      message: entry.message,
+      testId: ref.key,
+      ...entry,
+    });
+  } catch (error) {
+    console.error('Lỗi runAttendanceTest:', error);
+    res.status(500).json({ message: 'Lỗi server', error: error.message });
+  }
+};
+
+const getMyAttendanceTests = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const snap = await db.ref(`attendanceTests/${userId}`).once('value');
+    const data = snap.val() || {};
+
+    const result = Object.entries(data)
+      .map(([id, row]) => ({ id, ...row }))
+      .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0))
+      .slice(0, 100);
+
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('Lỗi getMyAttendanceTests:', error);
+    res.status(500).json({ message: 'Lỗi khi lấy lịch sử test' });
+  }
+};
+
+const getAllAttendanceTests = async (req, res) => {
+  try {
+    const snap = await db.ref('attendanceTests').once('value');
+    const all = snap.val() || {};
+    const usersSnap = await db.ref('users').once('value');
+    const users = usersSnap.val() || {};
+
+    const result = [];
+    Object.entries(all).forEach(([userId, tests]) => {
+      const u = users[userId] || {};
+      Object.entries(tests || {}).forEach(([testId, row]) => {
+        result.push({
+          id: testId,
+          userId,
+          fullName: u.personalInfo?.fullName || row.fullName || 'N/A',
+          employeeCode: u.employeeCode || row.employeeCode,
+          ...row,
+        });
+      });
+    });
+
+    result.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    res.status(200).json(result.slice(0, 500));
+  } catch (error) {
+    console.error('Lỗi getAllAttendanceTests:', error);
+    res.status(500).json({ message: 'Lỗi khi lấy danh sách test' });
+  }
+};
+
 module.exports = {
   getAllAttendances,
   getMyAttendances,
@@ -507,4 +742,7 @@ module.exports = {
   getWorkConfig,
   updateAttendanceNote,
   logSecurityAttempt,
+  runAttendanceTest,
+  getMyAttendanceTests,
+  getAllAttendanceTests,
 };
