@@ -1,0 +1,93 @@
+﻿ΓòöΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòù
+Γòæ       SPAM DETECTION TEST SUITE - Check-In Logic              Γòæ
+ΓòÜΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓò¥
+
+--- SCENARIO 1: Single check-in (no spam) ---
+  Result: spamDetected=false, selected=10:30:00
+
+--- SCENARIO 2: Two check-ins within 3 minutes ---
+  Result: spamDetected=true, selected=10:30:00, validCount=2
+
+--- SCENARIO 3: Multiple check-ins in sequence ---
+  Result: spamDetected=true, selected=10:30:00, validCount=5
+
+--- SCENARIO 4: Check-ins outside 3-minute window ---
+  Result: spamDetected=true, selected=10:30:00
+  Note: getFirstValidCheckIn() groups by 3-min window around earliest
+
+ΓòöΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòù
+Γòæ       SPAM DETECTION TEST SUITE - Check-Out Logic             Γòæ
+ΓòÜΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓò¥
+
+--- SCENARIO 5: Single check-out (no spam) ---
+  Result: spamDetected=false, selected=17:45:00
+
+--- SCENARIO 6: Multiple check-outs - keep LAST ---
+  Result: spamDetected=true, selected=17:46:10, validCount=3
+
+--- SCENARIO 7: Check-out within strict 3-min window ---
+  Result: spamDetected=true, selected=17:47:59
+
+--- SCENARIO 8: Check-out outside 3-minute window ---
+  Result: spamDetected=true, selected=17:50:00
+  Note: getLastValidCheckOut() groups by 3-min window around latest
+
+ΓòöΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòù
+Γòæ              EDGE CASES & BOUNDARY TESTS                      Γòæ
+ΓòÜΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓò¥
+
+--- EDGE CASE 1: Empty array ---
+  Check-in result: spamDetected=false, selected=null
+  Check-out result: spamDetected=false, selected=null
+
+--- EDGE CASE 2: Exactly at 3-minute boundary ---
+  Result: spamDetected=true, selected=10:30:00
+
+--- EDGE CASE 3: Just outside 3-minute boundary ---
+  Result: spamDetected=true, selected=10:30:00
+
+--- EDGE CASE 4: Unordered input ---
+  Result: spamDetected=true, selected=10:30:00
+
+ΓòöΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòù
+Γòæ                      TEST SUMMARY                             Γòæ
+ΓòÜΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓòÉΓò¥
+
+Γ£ô Single check-in should have spamDetected=false
+Γ£ô Single check-in should return a valid selection
+Γ£ô validCount should be 1
+Γ£ô Selected time should be 10:30:00
+Γ£ô Two check-ins within 3 min should have spamDetected=true
+Γ£ô validCount should be 2
+Γ£ô Should keep earliest (10:30:00)
+Γ£ô Multiple check-ins should have spamDetected=true
+Γ£ô validCount should be 5
+Γ£ô Should keep earliest (10:30:00)
+Γ£ô Multiple attempts (even outside window) should have spamDetected=true
+Γ£ô validCount should be 2
+Γ£ô Should select earliest time (first overall)
+Γ£ô Single check-out should have spamDetected=false
+Γ£ô Single check-out should return a valid selection
+Γ£ô validCount should be 1
+Γ£ô Selected time should be 17:45:00
+Γ£ô Multiple check-outs should have spamDetected=true
+Γ£ô validCount should be 3
+Γ£ô Should keep latest (17:46:10)
+Γ£ô Two check-outs within 3 min should have spamDetected=true
+Γ£ô Should keep latest within window
+Γ£ô Multiple attempts should have spamDetected=true
+Γ£ô Should select latest (last overall)
+Γ£ô Empty check-ins should have spamDetected=false
+Γ£ô Empty check-ins should return null
+Γ£ô Empty check-outs should have spamDetected=false
+Γ£ô Empty check-outs should return null
+Γ£ô Two check-ins at exact 3-min boundary should have spamDetected=true
+Γ£ô Should keep earliest
+Γ£ô Multiple attempts detected
+Γ£ô Should select first
+Γ£ô Unordered input should be detected as spam
+Γ£ô Should select earliest regardless of input order
+
+34 passed, 0 failed
+
+Γ£ô All tests passed!

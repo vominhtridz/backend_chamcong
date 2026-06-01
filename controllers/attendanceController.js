@@ -13,8 +13,21 @@ const {
   evaluateCheckOut,
   getShiftContext,
   calcWorkedMinutes,
+  getAttendanceStatusMatrix,
 } = require('../utils/shiftUtils');
 const { resolveShiftSettings } = require('../utils/shiftSettings');
+const {
+  filterSpamCheckins,
+  filterSpamCheckouts,
+  getFirstValidCheckIn,
+  getLastValidCheckOut,
+} = require('../utils/spamDetection');
+const {
+  createExceptionRequest,
+  shouldAutoCreateException,
+  EXCEPTION_TYPES,
+} = require('../utils/exceptionHandler');
+const AttendanceException = require('../models/AttendanceException');
 
 const loadGlobalSettings = async () => {
   const snap = await db.ref('settings').once('value');
@@ -249,6 +262,7 @@ const checkIn = async (req, res) => {
     }
 
     if (!existingRecord?.checkInTime) {
+      const ts = Date.now(); // Define ts first
       const checkInEval = evaluateCheckIn(now, settings);
       if (!checkInEval.allowed) {
         await logSecurity(req, 'time_fail', {
@@ -272,26 +286,53 @@ const checkIn = async (req, res) => {
             alreadyCompleted: true,
           });
         }
+        
+        // Handle spam check-in: Detect multiple check-ins within 3 minutes
         if (saved.checkInTime) {
-          return res.status(400).json({
-            message: 'Bạn đã check-in ca này. Vui lòng check-out để hoàn tất.',
-          });
+          const timeDiff = ts - saved.checkInTime;
+          const isSpam = timeDiff <= 3 * 60 * 1000; // 3 minutes in ms
+          
+          if (isSpam) {
+            // Keep first check-in, ignore this attempt
+            await logSecurity(req, 'spam_checkin', {
+              user,
+              message: 'Phát hiện check-in lặp lại (giữ lần check-in đầu tiên)',
+              severity: 'info',
+            });
+            return res.status(400).json({
+              message: 'Phát hiện check-in lặp lại. Đã ghi nhận lần check-in đầu tiên. Vui lòng check-out để hoàn tất.',
+              spamDetected: true,
+            });
+          }
         }
       }
 
       if (!imageUrl) imageUrl = await uploadToImgBB(base64Image);
 
-      const ts = Date.now();
       const checkInStatus = checkInEval.isLate ? 'Late' : 'OnTime';
+      
+      // Store check-in attempt
+      const checkInAttempt = {
+        timestamp: ts,
+        imageUrl,
+        faceDistance: match.minDistance,
+        location: locationMeta,
+        meta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
+      };
+
       await newRef.set({
         userId: matchedUserId,
         date: checkInEval.shiftDate,
         checkInTime: ts,
         checkOutTime: null,
+        checkInAttempts: [checkInAttempt],
+        checkOutAttempts: [],
         status: checkInStatus,
         lateMinutes: checkInEval.lateMinutes,
         isLate: checkInEval.isLate,
         checkOutStatus: null,
+        dailyStatus: 'Invalid', // Updated when check-out
+        dailyStatusReasons: [],
         note: typeof note === 'string' ? note.trim().slice(0, 500) : '',
         verifyImageIn: imageUrl,
         livenessChallenge: livenessChallenge || '',
@@ -304,12 +345,14 @@ const checkIn = async (req, res) => {
 
       await registerKnownDevice(matchedUserId, meta.deviceFingerprint, ip, userAgent);
       const lateNote = checkInEval.isLate ? ` (trễ ${checkInEval.lateMinutes} phút)` : '';
+      const graceNote = checkInEval.graceMinutes > 0 ? ` (Còn ${checkInEval.graceMinutes} phút grace period)` : '';
+      
       await logActivity({
         type: 'check_in',
         action: 'checkIn',
         severity: checkInEval.isLate ? 'warning' : 'info',
         ...brief,
-        message: `Check-in thành công${lateNote} — ${fullName}`,
+        message: `Check-in thành công${lateNote}${graceNote} — ${fullName}`,
         imageUrl,
         faceDistance: match.minDistance,
         lateMinutes: checkInEval.lateMinutes,
@@ -344,8 +387,38 @@ const checkIn = async (req, res) => {
     const ts = Date.now();
     const workedMinutes = calcWorkedMinutes(existingRecord.checkInTime, ts);
 
-    await attendanceRef.update({
+    // Handle spam check-out: Detect multiple check-outs within 3 minutes
+    if (existingRecord.checkOutTime) {
+      const timeDiff = ts - existingRecord.checkOutTime;
+      const isSpam = timeDiff <= 3 * 60 * 1000; // 3 minutes in ms
+      
+      if (isSpam) {
+        // Keep last check-out (update with latest timestamp)
+        await logSecurity(req, 'spam_checkout', {
+          user,
+          message: 'Phát hiện check-out lặp lại (cập nhật lần check-out cuối cùng)',
+          severity: 'info',
+        });
+      }
+    }
+
+    // Build check-out attempt
+    const checkOutAttempt = {
+      timestamp: ts,
+      imageUrl,
+      faceDistance: match.minDistance,
+      location: locationMeta,
+      meta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
+    };
+
+    // Get existing attempts and add new one
+    const existingCheckOutAttempts = existingRecord.checkOutAttempts || [];
+    const allCheckOutAttempts = [...existingCheckOutAttempts, checkOutAttempt];
+
+    // Calculate daily status matrix
+    const attendanceData = {
       checkOutTime: ts,
+      checkOutAttempts: allCheckOutAttempts,
       checkOutStatus: checkOutEval.checkOutStatus,
       earlyCheckoutMinutes: checkOutEval.earlyCheckoutMinutes,
       lateCheckoutMinutes: checkOutEval.lateCheckoutMinutes,
@@ -356,15 +429,28 @@ const checkIn = async (req, res) => {
       checkOutLocation: locationMeta,
       checkOutMeta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
       updatedAt: ts,
-    });
+    };
+
+    // Calculate daily status matrix
+    const fullRecord = { ...existingRecord, ...attendanceData };
+    const statusMatrix = getAttendanceStatusMatrix(fullRecord, settings);
+    attendanceData.dailyStatus = statusMatrix.dayStatus;
+    attendanceData.dailyStatusReasons = statusMatrix.reasons;
+
+    await attendanceRef.update(attendanceData);
 
     await registerKnownDevice(matchedUserId, meta.deviceFingerprint, ip, userAgent);
+    
+    const checkoutStatusMsg = checkOutEval.checkOutStatus === 'Overtime' 
+      ? `(OT - ${workedMinutes} phút làm)`
+      : `(${workedMinutes} phút làm)`;
+
     await logActivity({
       type: 'check_out',
       action: 'checkOut',
-      severity: 'info',
+      severity: checkOutEval.checkOutStatus === 'Early' ? 'warning' : 'info',
       ...brief,
-      message: `Check-out thành công (${workedMinutes} phút làm) — ${fullName}`,
+      message: `Check-out thành công ${checkoutStatusMsg} — ${fullName}`,
       imageUrl,
       faceDistance: match.minDistance,
       workedMinutes,
@@ -375,11 +461,13 @@ const checkIn = async (req, res) => {
     });
 
     const outMsg =
-      checkOutEval.lateCheckoutMinutes > 0
-        ? `Check-out trễ ${checkOutEval.lateCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
-        : checkOutEval.earlyCheckoutMinutes > 0
-          ? `Check-out sớm ${checkOutEval.earlyCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
-          : `Check-out đúng giờ — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`;
+      checkOutEval.lateCheckoutMinutes > 0 && checkOutEval.isOvertime
+        ? `Check-out trễ ${checkOutEval.lateCheckoutMinutes} phút (OT) — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+        : checkOutEval.lateCheckoutMinutes > 0
+          ? `Check-out trễ ${checkOutEval.lateCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+          : checkOutEval.earlyCheckoutMinutes > 0
+            ? `Check-out sớm ${checkOutEval.earlyCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+            : `Check-out đúng giờ — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`;
 
     return res.status(200).json({
       message: outMsg,
@@ -387,8 +475,11 @@ const checkIn = async (req, res) => {
       fullName,
       distance: match.minDistance.toFixed(4),
       status: 'Complete',
+      checkOutStatus: checkOutEval.checkOutStatus,
       workedMinutes,
       shiftDate: recordShiftDate,
+      dailyStatus: statusMatrix.dayStatus,
+      dailyStatusReasons: statusMatrix.reasons,
       alreadyCompleted: true,
     });
   } catch (error) {
@@ -735,6 +826,198 @@ const getAllAttendanceTests = async (req, res) => {
   }
 };
 
+/**
+ * Create exception request for missing check-in/out
+ */
+const createAttendanceException = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ message: 'Chưa xác thực tài khoản.' });
+    }
+
+    const { attendanceId, date, type, reason, comment, attachmentUrls } = req.body;
+
+    // Validate
+    if (!attendanceId || !date || !type || !reason) {
+      return res.status(400).json({
+        message: 'Thiếu thông tin: attendanceId, date, type, reason là bắt buộc',
+      });
+    }
+
+    // Create exception using utility function
+    const exceptionReq = createExceptionRequest({
+      userId,
+      attendanceId,
+      date,
+      type,
+      reason,
+      comment: comment || '',
+      attachmentUrls: attachmentUrls || [],
+    });
+
+    if (exceptionReq.error) {
+      return res.status(400).json({ message: exceptionReq.error });
+    }
+
+    // Save to database
+    const ref = db.ref('attendanceExceptions').push();
+    await ref.set(exceptionReq);
+
+    // Update attendance record to flag exception
+    await db.ref(`attendances/${attendanceId}`).update({
+      hasException: true,
+      exceptionId: ref.key,
+      updatedAt: Date.now(),
+    });
+
+    await logActivity({
+      type: 'exception_created',
+      severity: 'info',
+      userId,
+      message: `Tạo yêu cầu ngoại lệ: ${exceptionReq.type}`,
+      exceptionId: ref.key,
+      reason,
+      timestamp: Date.now(),
+    });
+
+    res.status(201).json({
+      message: 'Tạo yêu cầu ngoại lệ thành công. Vui lòng đợi duyệt từ quản lý.',
+      exceptionId: ref.key,
+      exception: exceptionReq,
+    });
+  } catch (error) {
+    console.error('Lỗi createAttendanceException:', error);
+    res.status(500).json({ message: 'Lỗi server', error: error.message });
+  }
+};
+
+/**
+ * Get user's exception requests
+ */
+const getMyExceptions = async (req, res) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ message: 'Chưa xác thực tài khoản.' });
+    }
+
+    const snap = await db.ref('attendanceExceptions').once('value');
+    const all = snap.val() || {};
+
+    const result = Object.entries(all)
+      .filter(([, exc]) => exc.userId === userId)
+      .map(([id, exc]) => ({ id, ...exc }))
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('Lỗi getMyExceptions:', error);
+    res.status(500).json({ message: 'Lỗi khi lấy danh sách yêu cầu ngoại lệ' });
+  }
+};
+
+/**
+ * Get all exception requests (Admin only)
+ */
+const getAllExceptions = async (req, res) => {
+  try {
+    const snap = await db.ref('attendanceExceptions').once('value');
+    const all = snap.val() || {};
+    const usersSnap = await db.ref('users').once('value');
+    const users = usersSnap.val() || {};
+
+    const result = Object.entries(all)
+      .map(([id, exc]) => {
+        const user = users[exc.userId] || {};
+        return {
+          id,
+          userId: exc.userId,
+          fullName: user.personalInfo?.fullName || 'N/A',
+          employeeCode: user.employeeCode || `NV${(exc.userId || '').slice(-6).toUpperCase()}`,
+          ...exc,
+        };
+      })
+      .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+    res.status(200).json(result);
+  } catch (error) {
+    console.error('Lỗi getAllExceptions:', error);
+    res.status(500).json({ message: 'Lỗi khi lấy danh sách yêu cầu ngoại lệ' });
+  }
+};
+
+/**
+ * Approve/Reject exception request (Admin only)
+ */
+const updateExceptionStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, approvalNote, adjustedCheckInTime, adjustedCheckOutTime } = req.body;
+    const adminId = req.user?.id;
+
+    if (!['Approved', 'Rejected'].includes(status)) {
+      return res.status(400).json({ message: 'Status phải là Approved hoặc Rejected' });
+    }
+
+    const ref = db.ref(`attendanceExceptions/${id}`);
+    const snap = await ref.once('value');
+
+    if (!snap.exists()) {
+      return res.status(404).json({ message: 'Không tìm thấy yêu cầu ngoại lệ.' });
+    }
+
+    const exception = snap.val();
+    const now = Date.now();
+
+    // Update exception status
+    await ref.update({
+      status,
+      approvalNote: approvalNote || '',
+      approvedBy: adminId,
+      approvedAt: now,
+      adjustedCheckInTime: adjustedCheckInTime || null,
+      adjustedCheckOutTime: adjustedCheckOutTime || null,
+      updatedAt: now,
+    });
+
+    // If approved and adjustments provided, update attendance record
+    if (status === 'Approved' && (adjustedCheckInTime || adjustedCheckOutTime)) {
+      const attendanceRef = db.ref(`attendances/${exception.attendanceId}`);
+      const updateData = { updatedAt: now };
+
+      if (adjustedCheckInTime) {
+        updateData.checkInTime = adjustedCheckInTime;
+        // Recalculate late minutes if needed
+        // This would require re-evaluating against settings
+      }
+
+      if (adjustedCheckOutTime) {
+        updateData.checkOutTime = adjustedCheckOutTime;
+      }
+
+      await attendanceRef.update(updateData);
+    }
+
+    await logActivity({
+      type: 'exception_updated',
+      severity: 'info',
+      adminId,
+      message: `${status === 'Approved' ? 'Duyệt' : 'Từ chối'} yêu cầu ngoại lệ`,
+      exceptionId: id,
+      status,
+      timestamp: now,
+    });
+
+    res.status(200).json({
+      message: `${status === 'Approved' ? 'Duyệt' : 'Từ chối'} yêu cầu ngoại lệ thành công.`,
+    });
+  } catch (error) {
+    console.error('Lỗi updateExceptionStatus:', error);
+    res.status(500).json({ message: 'Lỗi server', error: error.message });
+  }
+};
+
 module.exports = {
   getAllAttendances,
   getMyAttendances,
@@ -745,4 +1028,8 @@ module.exports = {
   runAttendanceTest,
   getMyAttendanceTests,
   getAllAttendanceTests,
+  createAttendanceException,
+  getMyExceptions,
+  getAllExceptions,
+  updateExceptionStatus,
 };
