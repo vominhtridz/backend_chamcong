@@ -8,10 +8,10 @@ const DEFAULT_SHIFT_TIMES = {
 /**
  * Gộp cấu hình global + giờ theo ca làm việc của nhân viên.
  */
-const resolveShiftSettings = (globalSettings = {}, workShift = 'office') => {
-  const shiftKey = workShift || 'office';
+const resolveShiftSettings = (globalSettings = {}, workShift = 'morning') => {
+  const shiftKey = workShift || 'morning';
   const shiftTimes = globalSettings.shiftTimes || {};
-  const perShift = shiftTimes[shiftKey] || DEFAULT_SHIFT_TIMES[shiftKey] || DEFAULT_SHIFT_TIMES.office;
+  const perShift = shiftTimes[shiftKey] || DEFAULT_SHIFT_TIMES[shiftKey] || DEFAULT_SHIFT_TIMES.morning;
 
   const legacyStart = globalSettings.workStartTime;
   const legacyEnd = globalSettings.workEndTime;

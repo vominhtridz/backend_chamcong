@@ -50,7 +50,8 @@ const getShiftDate = (now = new Date(), workStartTime, workEndTime) => {
   return today;
 };
 
-const getShiftBounds = (shiftDate, settings) => {
+const getShiftBounds = (shiftDate, settings, ) => {
+  
   const workStartTime = settings.workStartTime || DEFAULT_WORK_START;
   const workEndTime = settings.workEndTime || DEFAULT_WORK_END;
   const lateThreshold = Number(settings.lateThreshold) || 0;
