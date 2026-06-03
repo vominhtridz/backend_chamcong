@@ -7,18 +7,40 @@ const timeToMinutes = (hhmm) => {
   return h * 60 + m;
 };
 
-const formatDate = (date) => {
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
+// --- HÀM MỚI: Lấy chính xác Ngày/Giờ/Phút theo giờ Việt Nam bất chấp Server OS ---
+const getVnTimeParts = (date = new Date()) => {
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false // Ép định dạng 24h
+  });
+  const parts = formatter.formatToParts(date);
+  const getPart = (type) => parts.find(p => p.type === type).value;
+  
+  return {
+    year: Number(getPart('year')),
+    month: Number(getPart('month')),
+    day: Number(getPart('day')),
+    // Giờ 24h của Intl trả về 24 thay vì 0 lúc nửa đêm, cần normalize
+    hour: Number(getPart('hour')) === 24 ? 0 : Number(getPart('hour')), 
+    minute: Number(getPart('minute')),
+  };
 };
 
+// FIX: Dùng getVnTimeParts thay vì date.getFullYear(), date.getMonth()
+const formatDate = (date) => {
+  const { year, month, day } = getVnTimeParts(date);
+  const mm = String(month).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  return `${year}-${mm}-${dd}`;
+};
+
+// FIX: Ép cứng offset +07:00 vào chuỗi ISO để tạo Date chuẩn xác
 const parseDateAtTime = (dateStr, hhmm) => {
-  const [h, m] = hhmm.split(':').map(Number);
-  const d = new Date(`${dateStr}T00:00:00`);
-  d.setHours(h, m, 0, 0);
-  return d;
+  const [h, m] = hhmm.split(':');
+  // ISO format: YYYY-MM-DDTHH:mm:00+07:00
+  return new Date(`${dateStr}T${h.padStart(2, '0')}:${m.padStart(2, '0')}:00+07:00`);
 };
 
 const isOvernightShift = (workStartTime, workEndTime) =>
@@ -33,14 +55,16 @@ const getShiftDate = (now = new Date(), workStartTime, workEndTime) => {
     return today;
   }
 
-  const nowMin = now.getHours() * 60 + now.getMinutes();
+  // FIX: Lấy giờ phút chuẩn VN
+  const { hour, minute } = getVnTimeParts(now);
+  const nowMin = hour * 60 + minute;
   const startMin = timeToMinutes(workStartTime);
   const endMin = timeToMinutes(workEndTime);
 
   if (nowMin <= endMin) {
-    const prev = new Date(now);
-    prev.setDate(prev.getDate() - 1);
-    return formatDate(prev);
+    // Trừ đi 24h (bằng timestamp cho an toàn, không dùng setDate của server)
+    const prevTimestamp = now.getTime() - (24 * 60 * 60 * 1000);
+    return formatDate(new Date(prevTimestamp));
   }
 
   if (nowMin >= startMin) {
@@ -50,51 +74,41 @@ const getShiftDate = (now = new Date(), workStartTime, workEndTime) => {
   return today;
 };
 
-const getShiftBounds = (shiftDate, settings, ) => {
-  
+const getShiftBounds = (shiftDate, settings) => {
   const workStartTime = settings.workStartTime || DEFAULT_WORK_START;
   const workEndTime = settings.workEndTime || DEFAULT_WORK_END;
   const lateThreshold = Number(settings.lateThreshold) || 0;
 
   const checkInStart = parseDateAtTime(shiftDate, workStartTime);
-  const checkInDeadline = new Date(checkInStart);
-  checkInDeadline.setMinutes(checkInDeadline.getMinutes() + lateThreshold);
+  const checkInDeadline = new Date(checkInStart.getTime() + (lateThreshold * 60000));
 
-  const checkOutEnd = parseDateAtTime(shiftDate, workEndTime);
+  let checkOutEnd = parseDateAtTime(shiftDate, workEndTime);
   if (isOvernightShift(workStartTime, workEndTime)) {
-    checkOutEnd.setDate(checkOutEnd.getDate() + 1);
+    // FIX: Cộng thêm 24 tiếng bằng timestamp thay vì dùng setDate
+    checkOutEnd = new Date(checkOutEnd.getTime() + (24 * 60 * 60 * 1000));
   }
 
   return { checkInStart, checkInDeadline, checkOutEnd, workStartTime, workEndTime, lateThreshold };
 };
 
 const formatTimeVi = (date) =>
-  date.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+  date.toLocaleTimeString('vi-VN', { 
+    hour: '2-digit', 
+    minute: '2-digit',
+    timeZone: 'Asia/Ho_Chi_Minh'
+  });
 
 const minutesBetween = (later, earlier) =>
   Math.max(0, Math.floor((later.getTime() - earlier.getTime()) / 60000));
 
-/**
- * Kiểm tra check-in theo yêu cầu Vietnam:
- * - 08:00 - 10:45: On Time (grace period 15 min from 10:30)
- * - 10:46 - 13:00: Late (tính từ 08:00, không phải từ 10:30)
- * - Sau 13:00: Missing In
- * 
- * IMPORTANT: Late minutes count from original start time (08:00),
- * NOT from end of grace period (10:30).
- * Example: Check-in at 10:46 → Late = (10:46 - 08:00) = 166 minutes, NOT 16 minutes
- */
 const evaluateCheckIn = (now = new Date(), settings = {}) => {
   const shiftDate = getShiftDate(now, settings.workStartTime, settings.workEndTime);
   const bounds = getShiftBounds(shiftDate, settings);
   const { checkInStart, checkInDeadline, workStartTime } = bounds;
   
-  // Calculate extended deadline (lateThreshold + grace period)
-  const extendedDeadline = new Date(checkInStart);
-  const maxLateMinutes = Number(settings.maxLateMinutes) || 120; // Default 2 hours
-  extendedDeadline.setMinutes(extendedDeadline.getMinutes() + maxLateMinutes);
-
-  // Before start time
+  const maxLateMinutes = Number(settings.maxLateMinutes) || 120;
+  const extendedDeadline = new Date(checkInStart.getTime() + (maxLateMinutes * 60000));
+  
   if (now.getTime() < checkInStart.getTime()) {
     return {
       allowed: false,
@@ -106,14 +120,10 @@ const evaluateCheckIn = (now = new Date(), settings = {}) => {
     };
   }
 
-  // Calculate late minutes from original start time (NOT from grace period end)
   const lateMinutes = minutesBetween(now, checkInStart);
   const gracePeriodMinutes = Number(settings.lateThreshold) || 15;
-  
-  // Determine status based on grace period
   const isLate = lateMinutes > gracePeriodMinutes;
 
-  // Beyond extended deadline (no check-in allowed)
   if (now.getTime() > extendedDeadline.getTime()) {
     return {
       allowed: false,
@@ -125,7 +135,6 @@ const evaluateCheckIn = (now = new Date(), settings = {}) => {
     };
   }
 
-  // Within allowed window (even if late)
   return {
     allowed: true,
     shiftDate,
@@ -139,29 +148,19 @@ const evaluateCheckIn = (now = new Date(), settings = {}) => {
   };
 };
 
-/**
- * Kiểm tra check-out theo yêu cầu Vietnam:
- * - Trước 17:30: Early Out
- * - 17:30+: On Time
- * - 18:30+: Overtime (optional)
- * - Sau 23:59: Missing Out / Forgot checkout
- */
 const evaluateCheckOut = (now = new Date(), settings = {}, shiftDate) => {
   const bounds = getShiftBounds(shiftDate, settings);
   const { checkOutEnd, workEndTime } = bounds;
   const workEndMinutes = timeToMinutes(workEndTime);
   
-  // Parse check-out settings
-  const earlyOutMinutes = Number(settings.earlyOutThreshold) || 30; // Default 30 min early
+  const earlyOutMinutes = Number(settings.earlyOutThreshold) || 30;
   const overtimeStartMinutes = Number(settings.overtimeStartTime) 
     ? timeToMinutes(settings.overtimeStartTime)
-    : workEndMinutes + 60; // Default 1 hour after end time
-  const maxWorkMinutes = Number(settings.maxWorkMinutes) || 16 * 60; // Default 16 hours
+    : workEndMinutes + 60;
+  const maxWorkMinutes = Number(settings.maxWorkMinutes) || 16 * 60;
 
-  const earlyCheckoutMinutes =
-    now.getTime() < checkOutEnd.getTime() ? minutesBetween(checkOutEnd, now) : 0;
-  const lateCheckoutMinutes =
-    now.getTime() > checkOutEnd.getTime() ? minutesBetween(now, checkOutEnd) : 0;
+  const earlyCheckoutMinutes = now.getTime() < checkOutEnd.getTime() ? minutesBetween(checkOutEnd, now) : 0;
+  const lateCheckoutMinutes = now.getTime() > checkOutEnd.getTime() ? minutesBetween(now, checkOutEnd) : 0;
 
   let checkOutStatus = 'OnTime';
   let statusDetail = '';
@@ -169,8 +168,10 @@ const evaluateCheckOut = (now = new Date(), settings = {}, shiftDate) => {
   if (lateCheckoutMinutes > 0) {
     checkOutStatus = 'Late';
     
-    // Check if overtime
-    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    // FIX: Dùng giờ phút chuẩn VN để tính Overtime
+    const { hour, minute } = getVnTimeParts(now);
+    const nowMinutes = hour * 60 + minute;
+    
     if (nowMinutes >= overtimeStartMinutes) {
       checkOutStatus = 'Overtime';
       statusDetail = 'OT';
@@ -199,47 +200,20 @@ const evaluateCheckOut = (now = new Date(), settings = {}, shiftDate) => {
   };
 };
 
-/** Tính số phút làm việc từ check-in đến check-out */
 const calcWorkedMinutes = (checkInTime, checkOutTime) => {
   if (!checkInTime || !checkOutTime) return 0;
   return Math.max(0, Math.floor((checkOutTime - checkInTime) / 60000));
 };
 
-/**
- * Get daily attendance status matrix (Valid/Invalid)
- * @param {object} attendance - Attendance record
- * @param {object} settings - Shift settings
- * @returns {object} - { isValid, status, reasons, color }
- */
 const getAttendanceStatusMatrix = (attendance = {}, settings = {}) => {
+  // Giữ nguyên logic cũ... (không liên quan đến múi giờ)
   const reasons = [];
-  
-  // Check missing check-in
-  if (!attendance.checkInTime) {
-    reasons.push('Không check-in');
-  }
-  
-  // Check missing check-out
-  if (!attendance.checkOutTime) {
-    reasons.push('Không check-out');
-  }
-  
-  // Check late check-in
-  if (attendance.status === 'Late') {
-    reasons.push(`Đi trễ ${attendance.lateMinutes || 0} phút`);
-  }
-  
-  // Check early check-out
-  if (attendance.checkOutStatus === 'Early') {
-    reasons.push(`Về sớm ${attendance.earlyCheckoutMinutes || 0} phút`);
-  }
-  
-  // Check exception flag
-  if (attendance.hasException) {
-    reasons.push('Có ngoại lệ');
-  }
+  if (!attendance.checkInTime) reasons.push('Không check-in');
+  if (!attendance.checkOutTime) reasons.push('Không check-out');
+  if (attendance.status === 'Late') reasons.push(`Đi trễ ${attendance.lateMinutes || 0} phút`);
+  if (attendance.checkOutStatus === 'Early') reasons.push(`Về sớm ${attendance.earlyCheckoutMinutes || 0} phút`);
+  if (attendance.hasException) reasons.push('Có ngoại lệ');
 
-  // Valid day: Check-in OnTime AND Check-out OnTime
   const isValid = 
     attendance.checkInTime && 
     attendance.checkOutTime &&
@@ -249,7 +223,7 @@ const getAttendanceStatusMatrix = (attendance = {}, settings = {}) => {
 
   return {
     isValid,
-    dayStatus: isValid ? 'Valid' : 'Invalid', // Vietnamese: Đủ công / Không đủ công
+    dayStatus: isValid ? 'Valid' : 'Invalid',
     displayText: isValid ? 'Đủ công' : 'Không đủ công',
     reasons,
     color: isValid ? 'green' : 'red',
@@ -257,7 +231,6 @@ const getAttendanceStatusMatrix = (attendance = {}, settings = {}) => {
   };
 };
 
-/** Trạng thái ca hiện tại để hiển thị trên frontend */
 const getShiftContext = (now = new Date(), settings = {}, existingRecord = null) => {
   const shiftDate = getShiftDate(now, settings.workStartTime, settings.workEndTime);
   const bounds = getShiftBounds(shiftDate, settings);
@@ -272,8 +245,7 @@ const getShiftContext = (now = new Date(), settings = {}, existingRecord = null)
     phase = 'completed';
     canCheckIn = false;
     canCheckOut = false;
-    message =
-      'Bạn đã hoàn tất check-in và check-out cho ca này. Vui lòng chờ đến ngày ca tiếp theo để chấm công lại.';
+    message = 'Bạn đã hoàn tất check-in và check-out cho ca này. Vui lòng chờ đến ngày ca tiếp theo để chấm công lại.';
   } else if (existingRecord?.checkInTime && !existingRecord?.checkOutTime) {
     const checkOutEval = evaluateCheckOut(now, settings, existingRecord.date || shiftDate);
     phase = 'checkOut';
@@ -305,6 +277,10 @@ const getShiftContext = (now = new Date(), settings = {}, existingRecord = null)
       onTimeUntil: bounds.checkInDeadline.getTime(),
     },
     checkOutFrom: bounds.checkOutEnd.getTime(),
+    
+    // FIX: Gửi Real-time về cho frontend
+    serverCurrentTime: now.getTime(), 
+    serverCurrentTimeFormatted: formatTimeVi(now) // Gửi thêm chuỗi đọc được cho dễ debug
   };
 };
 

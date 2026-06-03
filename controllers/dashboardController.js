@@ -102,20 +102,29 @@ const getDashboardOverview = async (req, res) => {
     const incompleteShifts = attendances.filter((a) => a.checkInTime && !a.checkOutTime).length;
 
     // Biểu đồ 7 ngày
-    const last7Days = [];
+   const last7Days = [];
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+    
     for (let i = 6; i >= 0; i -= 1) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      const dateStr = formatDate(d);
+      // Dùng timestamp để trừ ngày thay vì dùng d.setDate() của OS Server
+      const d = new Date(now.getTime() - (i * ONE_DAY_MS)); 
+      const dateStr = formatDate(d); // Đảm bảo formatDate đã fix timezone
+      
       const dayRecords = attendances.filter((a) => a.date === dateStr);
       const dayPresent = dayRecords.filter((a) => a.checkInTime).length;
       const dayLate = dayRecords.filter((a) => a.status === 'Late').length;
       const dayOnTime = dayRecords.filter(
         (a) => a.status === 'Complete' || a.status === 'CheckedIn' || a.status === 'OnTime'
       ).length;
+      
       last7Days.push({
         date: dateStr,
-        label: d.toLocaleDateString('vi-VN', { weekday: 'short', day: '2-digit', month: '2-digit' }),
+        label: d.toLocaleDateString('vi-VN', { 
+          weekday: 'short', 
+          day: '2-digit', 
+          month: '2-digit',
+          timeZone: 'Asia/Ho_Chi_Minh' // <-- Ép cứng giờ Việt Nam cho nhãn biểu đồ
+        }),
         present: dayPresent,
         onTime: dayOnTime,
         late: dayLate,
@@ -277,6 +286,11 @@ const getDashboardOverview = async (req, res) => {
       ],
       chart7Days: last7Days,
       liveFeed,
+      serverTime: {
+        timestamp: now.getTime(), // Gửi cái này cho Frontend chạy đồng hồ đếm ngược / tính toán
+        formattedVN: now.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }), // Dạng chuỗi đọc được (để log/debug)
+        isoString: now.toISOString(),
+      },
       systemHealth: {
         database: dbHealth,
         faceApi: {
