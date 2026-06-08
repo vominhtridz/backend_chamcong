@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { verifyFirebase } = require('./config/firebase.js');
 
+
 async function startServer() {
   await verifyFirebase();
 
@@ -12,7 +13,6 @@ async function startServer() {
   app.use(express.json({ limit: '15mb' }));
   app.use(express.urlencoded({ extended: true, limit: '15mb' }));
   app.use(cors());
-
   // Routes
   app.use('/api/auth', require('./routes/authRoutes'));
   app.use('/api/attendances', require('./routes/attendanceRoutes'));

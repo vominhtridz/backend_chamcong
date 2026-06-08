@@ -109,18 +109,21 @@ const evaluateCheckIn = (now = new Date(), settings = {}) => {
   const maxLateMinutes = Number(settings.maxLateMinutes) || 120;
   const extendedDeadline = new Date(checkInStart.getTime() + (maxLateMinutes * 60000));
   
-  if (now.getTime() < checkInStart.getTime()) {
+  const earlyCheckInMinutes = 10;
+  const earlyCheckInStart = new Date(checkInStart.getTime() - earlyCheckInMinutes * 60000);
+
+  if (now.getTime() < earlyCheckInStart.getTime()) {
     return {
       allowed: false,
       shiftDate,
       lateMinutes: 0,
       isLate: false,
       status: null,
-      message: `Chưa đến giờ check-in (${workStartTime}). Vui lòng quay lại sau ${formatTimeVi(checkInStart)}.`,
+      message: `Chưa đến giờ check-in (${workStartTime}). Có thể check-in sớm 10 phút từ ${formatTimeVi(earlyCheckInStart)}.`,
     };
   }
 
-  const lateMinutes = minutesBetween(now, checkInStart);
+  const lateMinutes = now.getTime() > checkInStart.getTime() ? minutesBetween(now, checkInStart) : 0;
   const gracePeriodMinutes = Number(settings.lateThreshold) || 15;
   const isLate = lateMinutes > gracePeriodMinutes;
 
@@ -153,37 +156,39 @@ const evaluateCheckOut = (now = new Date(), settings = {}, shiftDate) => {
   const { checkOutEnd, workEndTime } = bounds;
   const workEndMinutes = timeToMinutes(workEndTime);
   
-  const earlyOutMinutes = Number(settings.earlyOutThreshold) || 30;
-  const overtimeStartMinutes = Number(settings.overtimeStartTime) 
-    ? timeToMinutes(settings.overtimeStartTime)
-    : workEndMinutes + 60;
-  const maxWorkMinutes = Number(settings.maxWorkMinutes) || 16 * 60;
-
   const earlyCheckoutMinutes = now.getTime() < checkOutEnd.getTime() ? minutesBetween(checkOutEnd, now) : 0;
-  const lateCheckoutMinutes = now.getTime() > checkOutEnd.getTime() ? minutesBetween(now, checkOutEnd) : 0;
 
+  if (earlyCheckoutMinutes > 0) {
+    return {
+      allowed: false,
+      checkOutStatus: 'Early',
+      earlyCheckoutMinutes,
+      lateCheckoutMinutes: 0,
+      isOvertime: false,
+      message: `Chưa đến giờ check-out. Giờ kết thúc ca: ${workEndTime}. Vui lòng quay lại sau ${formatTimeVi(checkOutEnd)}.`,
+    };
+  }
+
+  const lateCheckoutMinutes = now.getTime() > checkOutEnd.getTime() ? minutesBetween(now, checkOutEnd) : 0;
   let checkOutStatus = 'OnTime';
   let statusDetail = '';
 
   if (lateCheckoutMinutes > 0) {
     checkOutStatus = 'Late';
-    
-    // FIX: Dùng giờ phút chuẩn VN để tính Overtime
     const { hour, minute } = getVnTimeParts(now);
     const nowMinutes = hour * 60 + minute;
+    const overtimeStartMinutes = Number(settings.overtimeStartTime) 
+      ? timeToMinutes(settings.overtimeStartTime)
+      : workEndMinutes + 60;
     
     if (nowMinutes >= overtimeStartMinutes) {
       checkOutStatus = 'Overtime';
       statusDetail = 'OT';
     }
-  } else if (earlyCheckoutMinutes > 0) {
-    checkOutStatus = 'Early';
   }
 
   let message = 'Check-out đúng giờ — Ca làm việc hoàn tất.';
-  if (earlyCheckoutMinutes > 0) {
-    message = `Check-out sớm ${earlyCheckoutMinutes} phút (giờ kết thúc ca: ${workEndTime}). Có thể tạo yêu cầu giải trình.`;
-  } else if (lateCheckoutMinutes > 0 && checkOutStatus === 'Overtime') {
+  if (lateCheckoutMinutes > 0 && checkOutStatus === 'Overtime') {
     message = `Check-out trễ ${lateCheckoutMinutes} phút — Tính làm thêm giờ (OT).`;
   } else if (lateCheckoutMinutes > 0) {
     message = `Check-out trễ ${lateCheckoutMinutes} phút so với giờ kết thúc ca (${workEndTime}).`;
@@ -193,7 +198,7 @@ const evaluateCheckOut = (now = new Date(), settings = {}, shiftDate) => {
     allowed: true,
     checkOutStatus,
     statusDetail,
-    earlyCheckoutMinutes,
+    earlyCheckoutMinutes: 0,
     lateCheckoutMinutes,
     isOvertime: checkOutStatus === 'Overtime',
     message,
@@ -246,10 +251,10 @@ const getShiftContext = (now = new Date(), settings = {}, existingRecord = null)
     canCheckIn = false;
     canCheckOut = false;
     message = 'Bạn đã hoàn tất check-in và check-out cho ca này. Vui lòng chờ đến ngày ca tiếp theo để chấm công lại.';
-  } else if (existingRecord?.checkInTime && !existingRecord?.checkOutTime) {
+    } else if (existingRecord?.checkInTime && !existingRecord?.checkOutTime) {
     const checkOutEval = evaluateCheckOut(now, settings, existingRecord.date || shiftDate);
     phase = 'checkOut';
-    canCheckOut = true;
+    canCheckOut = checkOutEval.allowed;
     canCheckIn = false;
     message = checkOutEval.message;
   } else if (!existingRecord?.checkInTime) {

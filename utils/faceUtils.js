@@ -1,7 +1,7 @@
-const FACE_MATCH_THRESHOLD = 0.4;
-const FACE_MATCH_MARGIN = 0.08;
+const FACE_MATCH_THRESHOLD = 0.45;
+const FACE_MATCH_MARGIN = 0.04;
 /** Ngưỡng so khớp với mẫu của chính user đang đăng nhập (hơi nới vì điều kiện ánh sáng khác lúc đăng ký). */
-const FACE_SELF_MATCH_THRESHOLD = 0.45;
+const FACE_SELF_MATCH_THRESHOLD = 0.5;
 
 const euclideanDistance = (descA, descB) => {
   if (!Array.isArray(descA) || !Array.isArray(descB) || descA.length !== descB.length) {
@@ -125,12 +125,90 @@ const findFaceMatchForUser = (
 
   return { matched: true, userId, minDistance: selfMinDistance };
 };
+const findFaceMatchForAllUser = (
+  descriptor,
+  allFaces,
+  threshold = FACE_SELF_MATCH_THRESHOLD, // Đổi tên selfThreshold thành threshold vì không còn "self" nữa
+  margin = FACE_MATCH_MARGIN
+) => {
+  // Lưu trữ 2 người có kết quả giống nhất (Top 1 và Top 2)
+  let bestMatch = { userId: null, distance: Infinity };
+  let secondBestMatch = { userId: null, distance: Infinity };
 
+  // 1. Quét qua toàn bộ user trong Database
+  for (const [currentUserId, faceEntry] of Object.entries(allFaces || {})) {
+    const savedDescriptors = faceEntry?.face_descriptor;
+    
+    // Bỏ qua user này nếu không có dữ liệu khuôn mặt hợp lệ
+    if (!Array.isArray(savedDescriptors) || savedDescriptors.length === 0) {
+      continue;
+    }
+
+    // Tìm khoảng cách nhỏ nhất CỦA RIÊNG user đang lặp
+    let minDistanceForThisUser = Infinity;
+    for (const savedDesc of savedDescriptors) {
+      try {
+        const distance = euclideanDistance(savedDesc, descriptor);
+        if (distance < minDistanceForThisUser) {
+          minDistanceForThisUser = distance;
+        }
+      } catch {
+        // bỏ qua descriptor bị lỗi cấu trúc
+      }
+    }
+
+    // 2. Cập nhật bảng xếp hạng Top 1 và Top 2
+    if (minDistanceForThisUser < bestMatch.distance) {
+      // Đẩy Top 1 hiện tại xuống làm Top 2
+      secondBestMatch = { ...bestMatch };
+      // Gán kết quả mới làm Top 1
+      bestMatch = { userId: currentUserId, distance: minDistanceForThisUser };
+    } else if (minDistanceForThisUser < secondBestMatch.distance) {
+      // Nếu không thắng được Top 1 nhưng tốt hơn Top 2 hiện tại, cập nhật Top 2
+      secondBestMatch = { userId: currentUserId, distance: minDistanceForThisUser };
+    }
+  }
+
+  // --- KẾT THÚC VÒNG LẶP, BẮT ĐẦU ĐÁNH GIÁ KẾT QUẢ ---
+
+  // Trường hợp 1: Không tìm thấy ai, hoặc người giống nhất vẫn vượt quá ngưỡng cho phép
+  if (!bestMatch.userId || bestMatch.distance > threshold) {
+    return { 
+      matched: false, 
+      userId: null, 
+      minDistance: bestMatch.distance, 
+      reason: 'no_match' 
+    };
+  }
+
+  // Trường hợp 2: Có người giống nhất, nhưng người thứ 2 cũng giống gần bằng (khoảng cách < margin)
+  // => Hệ thống không dám chắc chắn là ai (ambiguous)
+  if (
+    secondBestMatch.userId && 
+    (secondBestMatch.distance - bestMatch.distance) < margin
+  ) {
+    return { 
+      matched: false, 
+      userId: null, 
+      minDistance: bestMatch.distance, 
+      reason: 'ambiguous',
+      candidates: [bestMatch.userId, secondBestMatch.userId] // Trả về cả 2 để tiện debug
+    };
+  }
+
+  // Trường hợp 3: Hoàn hảo! Tìm thấy 1 người duy nhất thỏa mãn mọi điều kiện
+  return { 
+    matched: true, 
+    userId: bestMatch.userId, 
+    minDistance: bestMatch.distance 
+  };
+};
 module.exports = {
   FACE_MATCH_THRESHOLD,
   FACE_SELF_MATCH_THRESHOLD,
   FACE_MATCH_MARGIN,
   euclideanDistance,
   findBestFaceMatch,
+  findFaceMatchForAllUser,
   findFaceMatchForUser,
 };

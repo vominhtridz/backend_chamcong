@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const {
+  kioskCheckIn,
   getAllAttendances,
   getMyAttendances,
   checkIn,
@@ -22,6 +23,7 @@ router.get('/work-config', protect, checkStatus, getWorkConfig);
 router.get('/me', protect, checkStatus, getMyAttendances);
 router.get('/', protect, adminOnly, getAllAttendances);
 router.post('/checkin', protect, checkStatus, checkIn);
+router.post('/kiosk-checkin', kioskCheckIn); // Public endpoint for multi-employee checkin
 router.post('/test', protect, checkStatus, runAttendanceTest);
 router.get('/test/me', protect, checkStatus, getMyAttendanceTests);
 router.get('/test', protect, adminOnly, getAllAttendanceTests);

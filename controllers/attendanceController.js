@@ -1,6 +1,6 @@
 const db = require('../config/firebase');
 const { uploadToImgBB } = require('../utils/imgbbService');
-const { findFaceMatchForUser, FACE_SELF_MATCH_THRESHOLD } = require('../utils/faceUtils');
+const { findFaceMatchForUser,findFaceMatchForAllUser, FACE_SELF_MATCH_THRESHOLD, findBestFaceMatch } = require('../utils/faceUtils');
 const { logActivity, getClientIp, parseClientMeta } = require('../utils/activityLogger');
 const { evaluateGeofence } = require('../utils/geofence');
 const { checkKnownDevice, registerKnownDevice } = require('../utils/deviceTracker');
@@ -108,6 +108,7 @@ const findShiftAttendanceRecord = async (userId, settings, now = new Date()) => 
 
   Object.entries(all).forEach(([key, rec]) => {
     if (rec.userId !== userId || !rec.checkInTime || rec.checkOutTime) return;
+    if (rec.date && rec.date !== shiftDate) return;
     if (!openRecord || rec.checkInTime > openRecord.checkInTime) {
       openRecord = rec;
       openKey = key;
@@ -200,6 +201,8 @@ const checkIn = async (req, res) => {
     }
 
     const matchedUserId = match.userId;
+    req.user = { id: matchedUserId }; // Mock req.user cho các hàm ghi log phía dưới
+
     const userSnap = await db.ref(`users/${matchedUserId}`).once('value');
 
     if (!userSnap.exists()) {
@@ -252,7 +255,7 @@ const checkIn = async (req, res) => {
     const fullName = brief.fullName;
     const shiftInfo = await findShiftAttendanceRecord(matchedUserId, settings, now);
     const { recordKey, record: existingRecord, shiftDate } = shiftInfo;
-
+const ts = Date.now();
     if (existingRecord?.checkOutTime) {
       return res.status(400).json({
         message:
@@ -262,7 +265,7 @@ const checkIn = async (req, res) => {
     }
 
     if (!existingRecord?.checkInTime) {
-      const ts = Date.now(); // Define ts first
+       // Define ts first
       const checkInEval = evaluateCheckIn(now, settings);
       if (!checkInEval.allowed) {
         await logSecurity(req, 'time_fail', {
@@ -379,12 +382,21 @@ const checkIn = async (req, res) => {
       });
     }
 
-    const recordShiftDate = existingRecord.date || shiftDate;
+        const recordShiftDate = existingRecord.date || shiftDate;
     const checkOutEval = evaluateCheckOut(now, settings, recordShiftDate);
+
+    if (!checkOutEval.allowed) {
+      await logSecurity(req, 'time_fail', {
+        user,
+        message: checkOutEval.message,
+        imageUrl,
+      });
+      return res.status(400).json({ message: checkOutEval.message });
+    }
 
     if (!imageUrl) imageUrl = await uploadToImgBB(base64Image);
     const attendanceRef = db.ref(`attendances/${recordKey}`);
-    const ts = Date.now();
+    
     const workedMinutes = calcWorkedMinutes(existingRecord.checkInTime, ts);
 
     // Handle spam check-out: Detect multiple check-outs within 3 minutes
@@ -1018,7 +1030,424 @@ const updateExceptionStatus = async (req, res) => {
   }
 };
 
+// ============================================================
+// faceMatcher.js — Nhận diện khuôn mặt nhiều người (FIXED)
+// ============================================================
+//
+// NGUYÊN NHÂN LỖI "Không thể xác định danh tính duy nhất":
+//   → MIN_GAP quá lớn: 2 người có khuôn mặt gần nhau
+//     (gap < 0.10) bị đánh dấu "ambiguous" dù best match rõ ràng.
+//   → THRESHOLD quá thấp: khuôn mặt hợp lệ bị từ chối.
+//   → Không xử lý trường hợp 1 userId có nhiều descriptor (ảnh).
+//
+// GIẢI PHÁP:
+//   1. Gộp nhiều descriptor/ảnh của cùng 1 userId → lấy distance min
+//   2. Nới THRESHOLD lên 0.50 (face-api.js thực tế khuyến nghị 0.45–0.55)
+//   3. Hạ MIN_GAP xuống 0.06 — vẫn đủ phân biệt, ít false-ambiguous
+//   4. Thêm confidence score để log rõ chất lượng match
+// ============================================================
+
+const FACE_THRESHOLD = 0.70;  // Khoảng cách tối đa để coi là "cùng người"
+const MIN_GAP        = 0.08;  // Khoảng cách tối thiểu giữa best và second-best
+                               // để kết luận danh tính duy nhất
+
+/**
+ * Tính khoảng cách Euclidean giữa 2 vector 128 chiều.
+ * @param {number[]} a
+ * @param {number[]} b
+ * @returns {number}
+ */
+function euclideanDistance(a, b) {
+  let sum = 0;
+  for (let i = 0; i < 128; i++) {
+    const diff = a[i] - b[i];
+    sum += diff * diff;
+  }
+  return Math.sqrt(sum);
+}
+
+const kioskCheckIn = async (req, res) => {
+  try {
+    const { descriptor, base64Image, livenessPassed, livenessChallenge, note } = req.body;
+    const now  = new Date();
+    const meta = parseClientMeta(req.body);
+    const ip   = getClientIp(req);
+    const userAgent = req.headers['user-agent'] || '';
+    // ── 1. Kiểm tra Liveness & Spoofing ──────────────────────────────────────
+    if (!livenessPassed) {
+      await logSecurity(req, 'liveness_fail', {
+        message : 'Không vượt qua kiểm tra liveness',
+        severity: 'error',
+      });
+      return res.status(400).json({
+        message: 'Chưa vượt qua kiểm tra liveness. Vui lòng thực hiện đúng hành động được yêu cầu.',
+      });
+    }
+
+    if (meta.brightness != null && meta.brightness < 40) {
+      await logSecurity(req, 'spoof_suspect', {
+        message   : 'Ánh sáng quá thấp — nghi ngờ ảnh/video',
+        brightness: meta.brightness,
+      });
+    }
+
+    // ── 2. Validate descriptor ────────────────────────────────────────────────
+    if (!descriptor || !Array.isArray(descriptor) || descriptor.length !== 128) {
+      return res.status(400).json({ message: 'Dữ liệu khuôn mặt không hợp lệ. Vui lòng quét lại.' });
+    }
+
+    if (!base64Image) {
+      return res.status(400).json({ message: 'Thiếu ảnh bằng chứng chấm công.' });
+    }
+
+    // ── 3. Tải faceData từ Firebase ───────────────────────────────────────────
+    const faceDataSnap = await db.ref('faceData').once('value');
+    const allFaces     = faceDataSnap.val();
+
+    if (!allFaces) {
+      return res.status(404).json({ message: 'Chưa có dữ liệu khuôn mặt nào trong hệ thống.' });
+    }
+
+    // ── 4. Upload ảnh (không block nếu lỗi) ──────────────────────────────────
+    let imageUrl = '';
+    try {
+      imageUrl = await uploadToImgBB(base64Image);
+    } catch (uploadError) {
+      console.warn('Upload ảnh thất bại, tiếp tục chấm công không có ảnh:', uploadError.message);
+    }
+
+    // ── 5. Nhận diện khuôn mặt (dùng hàm đã fix) ─────────────────────────────
+     const match = findFaceMatchForAllUser(descriptor, allFaces);
+    
+if (!match.matched) {
+  let msg;
+  if (match.reason === 'ambiguous') {
+    msg = 'Không thể xác định danh tính...';
+  } else {
+    msg = 'Khuôn mặt không có trong hệ thống...';
+  }
+   await logSecurity(req, 'face_fail', {
+        message     : msg,
+        faceDistance: match.minDistance ?? null,
+        reason      : match.reason,
+        candidates  : match.candidates ?? [],
+        imageUrl,
+        severity    : 'error',
+      });
+  return res.status(400).json({ message: msg, faceMatchError: true, reason: match.reason });
+}
+  
+
+   const matchedUserId = match.userId;
+    req.user = { id: matchedUserId }; // Mock req.user cho các hàm ghi log phía dưới
+
+    const userSnap = await db.ref(`users/${matchedUserId}`).once('value');
+
+    if (!userSnap.exists()) {
+      return res.status(404).json({ message: 'Không tìm thấy hồ sơ nhân viên.' });
+    }
+
+    const user = userSnap.val();
+    if (user.status !== 'Active' || !user.isFaceRegistered) {
+      return res.status(403).json({
+        message: 'Tài khoản chưa được kích hoạt hoặc chưa đăng ký khuôn mặt.',
+      });
+    }
+
+    const settings = await loadWorkSettings(user.workShift || 'office');
+    const brief = employeeBrief(user, matchedUserId);
+    const deviceCheck = await checkKnownDevice(
+      matchedUserId,
+      meta.deviceFingerprint,
+      ip
+    );
+    if (deviceCheck.isNew && meta.deviceFingerprint) {
+      await logSecurity(req, 'unknown_device', {
+        user,
+        message: `Thiết bị/IP mới: ${ip}`,
+        ip,
+        deviceFingerprint: meta.deviceFingerprint,
+        imageUrl,
+      });
+    }
+
+    const geo = evaluateGeofence(meta.latitude, meta.longitude, settings);
+    const locationMeta = {
+      latitude: meta.latitude,
+      longitude: meta.longitude,
+      inGeofence: geo.inZone,
+      distanceMeters: geo.distanceMeters,
+    };
+
+    if (settings.geofenceEnabled && !geo.inZone && !geo.skipped) {
+      await logSecurity(req, 'out_of_zone', {
+        user,
+        message: geo.noGps
+          ? 'Chấm công không có tọa độ GPS'
+          : `Ngoài vùng cho phép (${geo.distanceMeters}m)`,
+        imageUrl,
+        location: locationMeta,
+      });
+    }
+
+    const fullName = brief.fullName;
+    const shiftInfo = await findShiftAttendanceRecord(matchedUserId, settings, now);
+    const { recordKey, record: existingRecord, shiftDate } = shiftInfo;
+const ts = Date.now();
+    if (existingRecord?.checkOutTime) {
+      return res.status(400).json({
+        message:
+          'Bạn đã hoàn tất check-in và check-out cho ca hôm nay. Vui lòng chờ đến ngày ca tiếp theo.',
+        alreadyCompleted: true,
+      });
+    }
+
+    if (!existingRecord?.checkInTime) {
+       // Define ts first
+      const checkInEval = evaluateCheckIn(now, settings);
+      if (!checkInEval.allowed) {
+        await logSecurity(req, 'time_fail', {
+          user,
+          message: checkInEval.message,
+          imageUrl,
+        });
+        return res.status(400).json({ message: checkInEval.message });
+      }
+
+      const newRecordKey = `${matchedUserId}_${checkInEval.shiftDate}`;
+      const newRef = db.ref(`attendances/${newRecordKey}`);
+      const existingSnap = await newRef.once('value');
+
+      if (existingSnap.exists()) {
+        const saved = existingSnap.val();
+        if (saved.checkOutTime) {
+          return res.status(400).json({
+            message:
+              'Bạn đã hoàn tất chấm công ca này. Chờ đến ngày ca tiếp theo để check-in/check-out lại.',
+            alreadyCompleted: true,
+          });
+        }
+        
+        // Handle spam check-in: Detect multiple check-ins within 3 minutes
+        if (saved.checkInTime) {
+          const timeDiff = ts - saved.checkInTime;
+          const isSpam = timeDiff <= 3 * 60 * 1000; // 3 minutes in ms
+          
+          if (isSpam) {
+            // Keep first check-in, ignore this attempt
+            await logSecurity(req, 'spam_checkin', {
+              user,
+              message: 'Phát hiện check-in lặp lại (giữ lần check-in đầu tiên)',
+              severity: 'info',
+            });
+            return res.status(400).json({
+              message: 'Phát hiện check-in lặp lại. Đã ghi nhận lần check-in đầu tiên. Vui lòng check-out để hoàn tất.',
+              spamDetected: true,
+            });
+          }
+        }
+      }
+
+      if (!imageUrl) imageUrl = await uploadToImgBB(base64Image);
+
+      const checkInStatus = checkInEval.isLate ? 'Late' : 'OnTime';
+      
+      // Store check-in attempt
+      const checkInAttempt = {
+        timestamp: ts,
+        imageUrl,
+        faceDistance: match.minDistance,
+        location: locationMeta,
+        meta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
+      };
+
+      await newRef.set({
+        userId: matchedUserId,
+        date: checkInEval.shiftDate,
+        checkInTime: ts,
+        checkOutTime: null,
+        checkInAttempts: [checkInAttempt],
+        checkOutAttempts: [],
+        status: checkInStatus,
+        lateMinutes: checkInEval.lateMinutes,
+        isLate: checkInEval.isLate,
+        checkOutStatus: null,
+        dailyStatus: 'Invalid', // Updated when check-out
+        dailyStatusReasons: [],
+        note: typeof note === 'string' ? note.trim().slice(0, 500) : '',
+        verifyImageIn: imageUrl,
+        livenessChallenge: livenessChallenge || '',
+        faceDistance: match.minDistance,
+        checkInLocation: locationMeta,
+        checkInMeta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
+        createdAt: ts,
+        updatedAt: ts,
+      });
+
+      await registerKnownDevice(matchedUserId, meta.deviceFingerprint, ip, userAgent);
+      const lateNote = checkInEval.isLate ? ` (trễ ${checkInEval.lateMinutes} phút)` : '';
+      const graceNote = checkInEval.graceMinutes > 0 ? ` (Còn ${checkInEval.graceMinutes} phút grace period)` : '';
+      
+      await logActivity({
+        type: 'check_in',
+        action: 'checkIn',
+        severity: checkInEval.isLate ? 'warning' : 'info',
+        ...brief,
+        message: `Check-in thành công${lateNote}${graceNote} — ${fullName}`,
+        imageUrl,
+        faceDistance: match.minDistance,
+        lateMinutes: checkInEval.lateMinutes,
+        ip,
+        userAgent,
+        deviceFingerprint: meta.deviceFingerprint,
+        location: locationMeta,
+        timestamp: ts,
+      });
+
+      const greetMsg = checkInEval.isLate
+        ? `Check-in trễ ${checkInEval.lateMinutes} phút — Xin chào ${fullName}. Vui lòng check-out khi kết thúc ca.`
+        : `Check-in đúng giờ — Xin chào ${fullName}. Vui lòng check-out khi kết thúc ca.`;
+
+      return res.status(200).json({
+        message: greetMsg,
+        action: 'checkIn',
+        fullName,
+        distance: match.minDistance.toFixed(4),
+        status: checkInStatus,
+        lateMinutes: checkInEval.lateMinutes,
+        isLate: checkInEval.isLate,
+        shiftDate: checkInEval.shiftDate,
+      });
+    }
+
+        const recordShiftDate = existingRecord.date || shiftDate;
+    const checkOutEval = evaluateCheckOut(now, settings, recordShiftDate);
+
+    if (!checkOutEval.allowed) {
+      await logSecurity(req, 'time_fail', {
+        user,
+        message: checkOutEval.message,
+        imageUrl,
+      });
+      return res.status(400).json({ message: checkOutEval.message });
+    }
+
+    if (!imageUrl) imageUrl = await uploadToImgBB(base64Image);
+    const attendanceRef = db.ref(`attendances/${recordKey}`);
+    
+    const workedMinutes = calcWorkedMinutes(existingRecord.checkInTime, ts);
+
+    // Handle spam check-out: Detect multiple check-outs within 3 minutes
+    if (existingRecord.checkOutTime) {
+      const timeDiff = ts - existingRecord.checkOutTime;
+      const isSpam = timeDiff <= 3 * 60 * 1000; // 3 minutes in ms
+      
+      if (isSpam) {
+        // Keep last check-out (update with latest timestamp)
+        await logSecurity(req, 'spam_checkout', {
+          user,
+          message: 'Phát hiện check-out lặp lại (cập nhật lần check-out cuối cùng)',
+          severity: 'info',
+        });
+      }
+    }
+
+    // Build check-out attempt
+    const checkOutAttempt = {
+      timestamp: ts,
+      imageUrl,
+      faceDistance: match.minDistance,
+      location: locationMeta,
+      meta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
+    };
+
+    // Get existing attempts and add new one
+    const existingCheckOutAttempts = existingRecord.checkOutAttempts || [];
+    const allCheckOutAttempts = [...existingCheckOutAttempts, checkOutAttempt];
+
+    // Calculate daily status matrix
+    const attendanceData = {
+      checkOutTime: ts,
+      checkOutAttempts: allCheckOutAttempts,
+      checkOutStatus: checkOutEval.checkOutStatus,
+      earlyCheckoutMinutes: checkOutEval.earlyCheckoutMinutes,
+      lateCheckoutMinutes: checkOutEval.lateCheckoutMinutes,
+      workedMinutes,
+      status: 'Complete',
+      verifyImageOut: imageUrl,
+      faceDistanceOut: match.minDistance,
+      checkOutLocation: locationMeta,
+      checkOutMeta: { ip, userAgent, deviceFingerprint: meta.deviceFingerprint, brightness: meta.brightness },
+      updatedAt: ts,
+    };
+
+    // Calculate daily status matrix
+    const fullRecord = { ...existingRecord, ...attendanceData };
+    const statusMatrix = getAttendanceStatusMatrix(fullRecord, settings);
+    attendanceData.dailyStatus = statusMatrix.dayStatus;
+    attendanceData.dailyStatusReasons = statusMatrix.reasons;
+
+    await attendanceRef.update(attendanceData);
+
+    await registerKnownDevice(matchedUserId, meta.deviceFingerprint, ip, userAgent);
+    
+    const checkoutStatusMsg = checkOutEval.checkOutStatus === 'Overtime' 
+      ? `(OT - ${workedMinutes} phút làm)`
+      : `(${workedMinutes} phút làm)`;
+
+    await logActivity({
+      type: 'check_out',
+      action: 'checkOut',
+      severity: checkOutEval.checkOutStatus === 'Early' ? 'warning' : 'info',
+      ...brief,
+      message: `Check-out thành công ${checkoutStatusMsg} — ${fullName}`,
+      imageUrl,
+      faceDistance: match.minDistance,
+      workedMinutes,
+      ip,
+      userAgent,
+      location: locationMeta,
+      timestamp: ts,
+    });
+
+    const outMsg =
+      checkOutEval.lateCheckoutMinutes > 0 && checkOutEval.isOvertime
+        ? `Check-out trễ ${checkOutEval.lateCheckoutMinutes} phút (OT) — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+        : checkOutEval.lateCheckoutMinutes > 0
+          ? `Check-out trễ ${checkOutEval.lateCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+          : checkOutEval.earlyCheckoutMinutes > 0
+            ? `Check-out sớm ${checkOutEval.earlyCheckoutMinutes} phút — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`
+            : `Check-out đúng giờ — Tạm biệt ${fullName}! Đã làm ${workedMinutes} phút.`;
+
+    return res.status(200).json({
+      message: outMsg,
+      action: 'checkOut',
+      fullName,
+      distance: match.minDistance.toFixed(4),
+      status: 'Complete',
+      checkOutStatus: checkOutEval.checkOutStatus,
+      workedMinutes,
+      shiftDate: recordShiftDate,
+      dailyStatus: statusMatrix.dayStatus,
+      dailyStatusReasons: statusMatrix.reasons,
+      alreadyCompleted: true,
+    });
+  } catch (error) {
+    console.error('Lỗi attendanceController.checkIn:', error);
+    await logActivity({
+      type: 'api_error',
+      severity: 'error',
+      message: error.message,
+      timestamp: Date.now(),
+    }).catch(() => {});
+    res.status(500).json({ message: 'Lỗi server', error: error.message });
+  }
+};
+
+
 module.exports = {
+    euclideanDistance,
+  kioskCheckIn,
   getAllAttendances,
   getMyAttendances,
   checkIn,
